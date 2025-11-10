@@ -1,0 +1,31 @@
+This script is designed to clean up FSLogix profile containers stored in an Azure File Share by:
+
+Identifying .vhd or .vhdx files that haven't been modified in the last 60 days.
+Optionally force-closing open handles on those files.
+Deleting the files if they're not in use.
+Optionally removing empty parent folders after deletion.
+Providing a summary of the operation.
+
+Key Features:
+
+Safety-first: Uses -WhatIf and ShouldProcess to simulate actions before actual deletion.
+Recursive scanning: Traverses directories under the specified $RootPath.
+Handle management: Detects and optionally closes open file handles.
+Verbose logging: Helps track progress and decisions during execution.
+
+Suggestions for Improvement:
+
+
+Security: Avoid hardcoding the storage account key. Consider retrieving it from:
+
+Azure Key Vault
+Environment variables
+Secure automation accounts
+
+Logging: You might want to log the output to a file for audit purposes:
+PowerShell| Tee-Object -FilePath "FslogixCleanupLog.txt"Show more lines
+
+| Tee-Object -FilePath "FslogixCleanupLog.txt"
+
+Dry Run Confirmation: Before removing -WhatIf, ensure the output is reviewed and validated.
+Parallelism: For large shares, consider parallelizing the deletion process using background jobs or runspaces.
