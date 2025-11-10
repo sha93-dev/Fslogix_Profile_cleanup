@@ -1,0 +1,13 @@
+save the file in with .ps1 (.\Fslogix_Final_Script_working.ps1 )
+Redirect to the path vis powershell
+
+ 
+.\Fslogix_Final_Script_working.ps1 `
+  -StorageAccountName '*************************' `
+  -StorageAccountKey  '*************************' `
+  -ShareName          '***********' `
+  -RootPath           '***************' `
+  -DaysInactive       ** `
+  -ForceCloseHandles `
+  -DeleteEmptyProfileFolders `
+  -WhatIf
