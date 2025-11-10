@@ -1,0 +1,246 @@
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact='High')]
+
+param(
+
+  [Parameter(Mandatory)]
+
+  [string] $StorageAccountName,
+ 
+  [Parameter(Mandatory)]
+
+  [string] $StorageAccountKey,           # tip: pass from Key Vault / secure variable
+ 
+  [Parameter(Mandatory)]
+
+  [string] $ShareName,                   # e.g. "fslogix-profiles"
+ 
+  [int] $DaysInactive = 60,
+ 
+  [switch] $ForceCloseHandles,           # if set, closes open handles before delete
+ 
+  [switch] $DeleteEmptyProfileFolders,   # if set, removes user folder if empty after delete
+ 
+  [string] $RootPath = "t-ctx-codan"     # relative path under share ("" for share root)
+
+)
+ 
+#--- Create storage context with Access Key
+
+$ctx = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccountKey
+ 
+#--- Helpers -------------------------------------------------------------
+ 
+function Get-ItemsRecursive {
+
+  param(
+
+    [string] $RelPath = ""               # relative path within the share
+
+  )
+ 
+  $items = if ([string]::IsNullOrEmpty($RelPath)) {
+
+    Get-AzStorageFile -ShareName $ShareName -Context $ctx
+
+  } else {
+
+    (Get-AzStorageFile -ShareName $ShareName -Context $ctx -Path $RelPath) | Get-AzStorageFile
+
+  }
+ 
+  foreach ($i in $items) {
+
+    $isDir = ($i.GetType().Name -match 'Directory')
+
+    $path  = if ([string]::IsNullOrEmpty($RelPath)) { $i.Name } else { ($RelPath.TrimEnd('/\') + '/' + $i.Name) }
+ 
+    if ($isDir) {
+
+      Get-ItemsRecursive -RelPath $path
+
+    } else {
+
+      try {
+
+        if ($i.PSObject.Properties.Name -contains 'FetchAttributes') { $i.FetchAttributes() }
+
+      } catch {}
+ 
+      $lastModified =
+
+        if ($i.PSObject.Properties.Name -contains 'LastModified') { $i.LastModified.DateTime }
+
+        elseif ($i.PSObject.Properties.Name -contains 'Properties' -and $i.Properties.LastModified) { $i.Properties.LastModified }
+
+        else { $null }
+ 
+      [PSCustomObject]@{
+
+        Path         = $path.Replace('\','/').TrimStart('/')
+
+        Name         = $i.Name
+
+        Length       = $i.Length
+
+        LastModified = $lastModified
+
+        Raw          = $i
+
+      }
+
+    }
+
+  }
+
+}
+ 
+function Test-FileInUse {
+
+  param([string] $RelFilePath)
+ 
+  $handles = Get-AzStorageFileHandle -ShareName $ShareName -Context $ctx -Path $RelFilePath -ErrorAction SilentlyContinue
+
+  return ($handles -and $handles.Count -gt 0)
+
+}
+ 
+function Close-FileHandles {
+
+  param([string] $RelFilePath)
+ 
+  Close-AzStorageFileHandle -ShareName $ShareName -Context $ctx -ShareFileClient `
+
+    (Get-AzStorageFile -ShareName $ShareName -Context $ctx -Path $RelFilePath).ShareFileClient `
+
+    -CloseAll -Confirm:$false -WhatIf:$WhatIf | Out-Null
+
+}
+ 
+function Remove-EmptyParents {
+
+  param([string] $RelPath)
+ 
+  $current = Split-Path -Path $RelPath -Parent
+
+  $boundary = $RootPath.Trim('/\')
+ 
+  while ($current) {
+
+    if ($boundary -and ($current -eq $boundary)) { break }
+
+    $entries = (Get-AzStorageFile -ShareName $ShareName -Context $ctx -Path $current | Get-AzStorageFile)
+
+    if ($entries.Count -eq 0) {
+
+      if ($PSCmdlet.ShouldProcess("dir:$current", "Remove empty directory")) {
+
+        Remove-AzStorageDirectory -ShareName $ShareName -Path $current -Context $ctx -Confirm:$false -WhatIf:$WhatIf | Out-Null
+
+      }
+
+      $current = Split-Path -Path $current -Parent
+
+    } else {
+
+      break
+
+    }
+
+  }
+
+}
+ 
+#--- Main ---------------------------------------------------------------
+ 
+$cutoff = (Get-Date).AddDays(-[math]::Abs($DaysInactive))
+ 
+Write-Verbose "Share: $ShareName | RootPath: '$RootPath' | Cutoff: $cutoff"
+ 
+$allFiles = Get-ItemsRecursive -RelPath $RootPath
+ 
+$targetFiles = $allFiles |
+
+  Where-Object {
+
+    $_.Name -match '\.vh(d|dx)$' -and
+
+    $_.LastModified -and ($_.LastModified -lt $cutoff)
+
+  }
+ 
+$toDeleteCount = 0
+
+$toDeleteBytes = 0
+
+$deletedCount  = 0
+
+$deletedBytes  = 0
+
+$skippedInUse  = @()
+ 
+foreach ($f in $targetFiles) {
+
+  $toDeleteCount++
+
+  $toDeleteBytes += ($f.Length | ForEach-Object { $_ })
+ 
+  $inUse = Test-FileInUse -RelFilePath $f.Path
+
+  if ($inUse) {
+
+    if ($ForceCloseHandles) {
+
+      Write-Verbose "Force-closing handles: $($f.Path)"
+
+      Close-FileHandles -RelFilePath $f.Path
+
+      Start-Sleep -Seconds 2
+
+      $inUse = Test-FileInUse -RelFilePath $f.Path
+
+    }
+
+  }
+ 
+  if ($inUse) {
+
+    $skippedInUse += $f.Path
+
+    continue
+
+  }
+ 
+  if ($PSCmdlet.ShouldProcess("file:$($f.Path)", "Delete")) {
+
+    Remove-AzStorageFile -ShareName $ShareName -Path $f.Path -Context $ctx -Confirm:$false -WhatIf:$WhatIf | Out-Null
+
+    $deletedCount++
+
+    $deletedBytes += $f.Length
+ 
+    if ($DeleteEmptyProfileFolders) {
+
+      Remove-EmptyParents -RelPath $f.Path
+
+    }
+
+  }
+
+}
+ 
+[PSCustomObject]@{
+
+  CutoffDate           = $cutoff
+
+  Candidates           = $toDeleteCount
+
+  CandidateSizeGiB     = [Math]::Round($toDeleteBytes/1GB, 2)
+
+  Deleted              = $deletedCount
+
+  DeletedSizeGiB       = [Math]::Round($deletedBytes/1GB, 2)
+
+  SkippedInUse         = $skippedInUse
+
+} | Format-List
+ 
